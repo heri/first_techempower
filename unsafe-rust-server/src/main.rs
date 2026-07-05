@@ -1,12 +1,14 @@
 // Hand-rolled unsafe-Rust HTTP server for a 2-endpoint TechEmpower-style benchmark.
 // No async runtime, no HTTP crate: raw BSD sockets + kqueue, one thread per core,
 // SO_REUSEPORT fan-out, and a hand-written sqlite3 FFI for the "data store" endpoint.
+//
+// Optimized variant: zero per-request heap allocations, a flat fd-indexed
+// connection table instead of a hash map, and best-effort core affinity pinning.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::os::unix::io::RawFd;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PORT: u16 = 8080;
@@ -153,25 +155,27 @@ impl XorShift {
     }
 }
 
-// ---------- shared Date header, refreshed once/sec by a background thread ----------
+// ---------- shared clock: one atomic, refreshed once/sec, no locks on the read path ----------
 
-static DATE_BUF: OnceDate = OnceDate::new();
+static EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
 
-struct OnceDate(RwLock<[u8; 29]>);
-impl OnceDate {
-    const fn new() -> Self {
-        OnceDate(RwLock::new(*b"Thu, 01 Jan 1970 00:00:00 GMT"))
-    }
-    fn set(&self, bytes: [u8; 29]) {
-        *self.0.write().unwrap() = bytes;
-    }
-    fn get(&self) -> [u8; 29] {
-        *self.0.read().unwrap()
-    }
+fn spawn_date_updater() {
+    let now_secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    // Set synchronously before returning so worker threads never observe epoch 0.
+    EPOCH_SECS.store(now_secs(), Ordering::Relaxed);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        EPOCH_SECS.store(now_secs(), Ordering::Relaxed);
+    });
 }
 
-fn format_http_date(now: SystemTime) -> [u8; 29] {
-    let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+fn format_http_date(epoch_secs: u64) -> [u8; 29] {
+    let secs = epoch_secs as i64;
     let days = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400);
     let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
@@ -209,11 +213,41 @@ fn format_http_date(now: SystemTime) -> [u8; 29] {
     out
 }
 
-fn spawn_date_updater() {
-    std::thread::spawn(|| loop {
-        DATE_BUF.set(format_http_date(SystemTime::now()));
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    });
+// ---------- best-effort core affinity (macOS Mach API; a scheduling *hint*, not a
+// hard pin like Linux's sched_setaffinity — Apple doesn't guarantee placement) ----------
+
+#[allow(non_camel_case_types)]
+type thread_t = u32;
+#[allow(non_camel_case_types)]
+type kern_return_t = i32;
+
+#[repr(C)]
+struct ThreadAffinityPolicy {
+    affinity_tag: i32,
+}
+
+const THREAD_AFFINITY_POLICY: c_int = 4;
+const THREAD_AFFINITY_POLICY_COUNT: u32 = 1;
+
+extern "C" {
+    fn pthread_mach_thread_np(thread: libc::pthread_t) -> thread_t;
+    fn thread_policy_set(
+        thread: thread_t,
+        flavor: c_int,
+        policy_info: *mut i32,
+        count: u32,
+    ) -> kern_return_t;
+}
+
+unsafe fn pin_to_affinity_tag(tag: i32) {
+    let mach_thread = pthread_mach_thread_np(libc::pthread_self());
+    let mut policy = ThreadAffinityPolicy { affinity_tag: tag };
+    thread_policy_set(
+        mach_thread,
+        THREAD_AFFINITY_POLICY,
+        &mut policy as *mut ThreadAffinityPolicy as *mut i32,
+        THREAD_AFFINITY_POLICY_COUNT,
+    );
 }
 
 // ---------- raw socket / kqueue plumbing ----------
@@ -293,6 +327,24 @@ struct Conn {
     len: usize,
 }
 
+/// Flat fd-indexed connection table: no hashing, just direct indexing.
+/// fds are small dense integers assigned by the kernel, so this stays compact.
+type ConnTable = Vec<Option<Conn>>;
+
+fn conn_insert(conns: &mut ConnTable, fd: RawFd, conn: Conn) {
+    let idx = fd as usize;
+    if idx >= conns.len() {
+        conns.resize_with(idx + 1, || None);
+    }
+    conns[idx] = Some(conn);
+}
+
+fn conn_remove(conns: &mut ConnTable, fd: RawFd) {
+    if let Some(slot) = conns.get_mut(fd as usize) {
+        *slot = None;
+    }
+}
+
 enum Route {
     Json,
     Db,
@@ -354,57 +406,117 @@ unsafe fn parse_one(buf: *const u8, len: usize) -> Option<(Route, usize)> {
     Some((route, total))
 }
 
-// ---------- response templates ----------
+// ---------- response building: zero heap allocation on the hot path ----------
 
-fn json_response_template() -> Vec<u8> {
-    let body = b"{\"message\":\"Hello, World!\"}";
-    build_headers("application/json", body.len(), body)
+const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+const DB_HEADER_PREFIX: &[u8] =
+    b"HTTP/1.1 200 OK\r\nServer: unsafe-rs\r\nContent-Type: application/json\r\nContent-Length: ";
+
+/// The /json response is fully static except for a 29-byte Date field, so it's
+/// built once per thread and only that slice is patched in place thereafter —
+/// no allocation, no copying of the rest of the response, ever again.
+struct JsonTemplate {
+    buf: Vec<u8>,
+    date_offset: usize,
+    cached_epoch: u64,
 }
 
-fn build_headers(content_type: &str, content_len: usize, body: &[u8]) -> Vec<u8> {
-    let date = DATE_BUF.get();
-    let mut out = Vec::with_capacity(160 + body.len());
-    out.extend_from_slice(b"HTTP/1.1 200 OK\r\nServer: unsafe-rs\r\nContent-Type: ");
-    out.extend_from_slice(content_type.as_bytes());
-    out.extend_from_slice(b"\r\nContent-Length: ");
-    out.extend_from_slice(content_len.to_string().as_bytes());
-    out.extend_from_slice(b"\r\nDate: ");
-    out.extend_from_slice(&date);
-    out.extend_from_slice(b"\r\n\r\n");
-    out.extend_from_slice(body);
-    out
+impl JsonTemplate {
+    fn new() -> Self {
+        let body: &[u8] = b"{\"message\":\"Hello, World!\"}";
+        let mut buf = Vec::with_capacity(160);
+        buf.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nServer: unsafe-rs\r\nContent-Type: application/json\r\nContent-Length: ",
+        );
+        buf.extend_from_slice(body.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\nDate: ");
+        let date_offset = buf.len();
+        buf.extend_from_slice(&[b' '; 29]);
+        buf.extend_from_slice(b"\r\n\r\n");
+        buf.extend_from_slice(body);
+        JsonTemplate {
+            buf,
+            date_offset,
+            cached_epoch: 0,
+        }
+    }
+
+    /// Patches the Date field in place if the wall-clock second has ticked over.
+    fn refresh(&mut self, epoch: u64, date_bytes: &[u8; 29]) {
+        if epoch != self.cached_epoch {
+            self.buf[self.date_offset..self.date_offset + 29].copy_from_slice(date_bytes);
+            self.cached_epoch = epoch;
+        }
+    }
 }
 
-fn not_found_response() -> Vec<u8> {
-    let body = b"Not Found";
-    let mut out = Vec::new();
-    out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\n");
-    out.extend_from_slice(body);
-    out
+/// Writes an unsigned decimal integer into `buf`, returns the number of bytes written.
+fn write_uint(buf: &mut [u8], mut n: u32) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = tmp[i - 1 - j];
+    }
+    i
 }
 
-fn db_response(id: i32, random_number: i32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(48);
-    body.extend_from_slice(b"{\"id\":");
-    body.extend_from_slice(id.to_string().as_bytes());
-    body.extend_from_slice(b",\"randomNumber\":");
-    body.extend_from_slice(random_number.to_string().as_bytes());
-    body.push(b'}');
-    build_headers("application/json", body.len(), &body)
+/// Builds the /db response into a caller-owned scratch buffer (stack-allocated by
+/// the caller, reused every request) and returns the number of bytes written.
+fn build_db_response(scratch: &mut [u8; 256], id: i32, random_number: i32, date: &[u8; 29]) -> usize {
+    let mut body = [0u8; 48];
+    let mut bp = 0usize;
+    body[bp..bp + 6].copy_from_slice(b"{\"id\":");
+    bp += 6;
+    bp += write_uint(&mut body[bp..], id as u32);
+    body[bp..bp + 16].copy_from_slice(b",\"randomNumber\":");
+    bp += 16;
+    bp += write_uint(&mut body[bp..], random_number as u32);
+    body[bp] = b'}';
+    bp += 1;
+
+    let mut pos = 0usize;
+    scratch[pos..pos + DB_HEADER_PREFIX.len()].copy_from_slice(DB_HEADER_PREFIX);
+    pos += DB_HEADER_PREFIX.len();
+    pos += write_uint(&mut scratch[pos..], bp as u32);
+    scratch[pos..pos + 8].copy_from_slice(b"\r\nDate: ");
+    pos += 8;
+    scratch[pos..pos + 29].copy_from_slice(date);
+    pos += 29;
+    scratch[pos..pos + 4].copy_from_slice(b"\r\n\r\n");
+    pos += 4;
+    scratch[pos..pos + bp].copy_from_slice(&body[..bp]);
+    pos += bp;
+    pos
 }
 
 // ---------- worker thread ----------
 
-fn worker_loop() {
+fn worker_loop(idx: usize) {
     unsafe {
+        pin_to_affinity_tag(idx as i32);
+
         let listen_fd = make_listener();
         let kq = libc::kqueue();
         assert!(kq >= 0);
         kqueue_add_read(kq, listen_fd);
 
         let world = WorldDb::open();
-        let mut rng = XorShift::new(std::process::id() as u64 ^ (listen_fd as u64) ^ 0xA5A5_A5A5);
-        let mut conns: HashMap<RawFd, Conn> = HashMap::new();
+        let mut rng = XorShift::new(std::process::id() as u64 ^ (idx as u64) ^ 0xA5A5_A5A5);
+        let mut conns: ConnTable = Vec::new();
+
+        let mut json_tpl = JsonTemplate::new();
+        let mut date_epoch: u64 = 0;
+        let mut date_bytes: [u8; 29] = *b"Thu, 01 Jan 1970 00:00:00 GMT";
+        let mut db_scratch = [0u8; 256];
 
         let mut events: [libc::kevent; 256] = std::mem::zeroed();
 
@@ -424,6 +536,13 @@ fn worker_loop() {
                 break;
             }
 
+            let epoch = EPOCH_SECS.load(Ordering::Relaxed);
+            if epoch != date_epoch {
+                date_bytes = format_http_date(epoch);
+                date_epoch = epoch;
+            }
+            json_tpl.refresh(epoch, &date_bytes);
+
             for ev in &events[..n as usize] {
                 let fd = ev.ident as RawFd;
 
@@ -435,7 +554,8 @@ fn worker_loop() {
                         }
                         set_nonblocking(cfd);
                         kqueue_add_read(kq, cfd);
-                        conns.insert(
+                        conn_insert(
+                            &mut conns,
                             cfd,
                             Conn {
                                 buf: [0u8; CONN_BUF],
@@ -446,9 +566,17 @@ fn worker_loop() {
                     continue;
                 }
 
-                let close_conn = handle_readable(fd, &mut conns, &world, &mut rng);
+                let close_conn = handle_readable(
+                    fd,
+                    &mut conns,
+                    &world,
+                    &mut rng,
+                    &json_tpl,
+                    &date_bytes,
+                    &mut db_scratch,
+                );
                 if close_conn {
-                    conns.remove(&fd);
+                    conn_remove(&mut conns, fd);
                     libc::close(fd);
                 }
             }
@@ -457,13 +585,17 @@ fn worker_loop() {
 }
 
 /// Returns true if the connection should be closed.
+#[allow(clippy::too_many_arguments)]
 unsafe fn handle_readable(
     fd: RawFd,
-    conns: &mut HashMap<RawFd, Conn>,
+    conns: &mut ConnTable,
     world: &WorldDb,
     rng: &mut XorShift,
+    json_tpl: &JsonTemplate,
+    date_bytes: &[u8; 29],
+    db_scratch: &mut [u8; 256],
 ) -> bool {
-    let conn = match conns.get_mut(&fd) {
+    let conn = match conns.get_mut(fd as usize).and_then(|slot| slot.as_mut()) {
         Some(c) => c,
         None => return true,
     };
@@ -491,15 +623,16 @@ unsafe fn handle_readable(
             break;
         };
 
-        let response = match route {
-            Route::Json => json_response_template(),
+        let ok = match route {
+            Route::Json => write_all(fd, &json_tpl.buf),
             Route::Db => {
                 let (id, rn) = world.fetch_random(rng);
-                db_response(id, rn)
+                let len = build_db_response(db_scratch, id, rn, date_bytes);
+                write_all(fd, &db_scratch[..len])
             }
-            Route::NotFound => not_found_response(),
+            Route::NotFound => write_all(fd, NOT_FOUND),
         };
-        if !write_all(fd, &response) {
+        if !ok {
             return true;
         }
 
@@ -540,14 +673,13 @@ fn main() {
     seed_database();
 
     spawn_date_updater();
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     println!("listening on 0.0.0.0:{PORT} with {n} worker threads (SO_REUSEPORT)");
 
     let mut handles = Vec::new();
-    for _ in 0..n {
-        handles.push(std::thread::spawn(worker_loop));
+    for i in 0..n {
+        handles.push(std::thread::spawn(move || worker_loop(i)));
     }
     for h in handles {
         let _ = h.join();
