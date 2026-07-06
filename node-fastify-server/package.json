@@ -1,0 +1,11 @@
+{
+  "name": "node-fastify-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "pg": "^8.12.0"
+  }
+}
